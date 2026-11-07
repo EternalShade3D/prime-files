@@ -15,7 +15,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::resizable::ResizableState;
-use nohrs_core::config::{Compact, DockSide, Explorer as ExplorerConfig, Layout, SplitDirection, Ui};
+use nohrs_core::config::{Compact, DockSide, Explorer as ExplorerConfig, Layout, NewTabMode, SplitDirection, Ui};
 use nohrs_core::telemetry::LogErr;
 use nohrs_services::fs::trash::Ledger as TrashLedger;
 use nohrs_services::search::SearchService;
@@ -82,8 +82,10 @@ actions!(
         FocusNextPane,
         /// Move focus to the previous pane, wrapping around.
         FocusPrevPane,
-        /// Open a new tab in the active pane, rooted at home.
+        /// Open a new tab in the active pane, at `[ui] new_tab_path`.
         NewTab,
+        /// Open the box that searches the computer or takes a typed path.
+        GoTo,
         /// Close the active tab (closing the pane if it was its last tab).
         CloseTab,
         /// Toggle the active tab's left quick-access sidebar.
@@ -122,6 +124,7 @@ pub fn rebind_shortcuts(cx: &mut App) {
     use nohrs_core::shortcuts::{Action, chords};
     let page_actions = [
         Action::NewTab,
+        Action::GoTo,
         Action::CloseTab,
         Action::SplitVertical,
         Action::SplitHorizontal,
@@ -149,6 +152,7 @@ pub fn rebind_shortcuts(cx: &mut App) {
     for (keys, action) in &wanted {
         bindings.push(match action {
             Action::NewTab => KeyBinding::new(keys, NewTab, context),
+            Action::GoTo => KeyBinding::new(keys, GoTo, context),
             Action::CloseTab => KeyBinding::new(keys, CloseTab, context),
             Action::SplitVertical => KeyBinding::new(keys, SplitVertical, context),
             Action::SplitHorizontal => KeyBinding::new(keys, SplitHorizontal, context),
@@ -415,8 +419,87 @@ impl ExplorerPage {
         Some(index)
     }
 
-    /// Opens a new tab in `pane_index`, rooted at home (§4), and activates it.
+    /// Whether the box opens instead of a tab: Shift asked for it, or
+    /// `[ui] new_tab_mode` says so.
+    pub(crate) fn new_tab_asks(&self, ask: bool) -> bool {
+        ask || self.ui.new_tab_mode == NewTabMode::Box
+    }
+
+    /// What Ctrl+T and the `+` do: the box when `ask` is set (Shift) or
+    /// `[ui] new_tab_mode` says so, a tab at `new_tab_path` otherwise.
+    pub(crate) fn new_tab_request(
+        &mut self,
+        pane_index: usize,
+        ask: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active(pane_index, window, cx);
+        if !self.new_tab_asks(ask) {
+            self.new_tab_in_pane(pane_index, window, cx);
+            return;
+        }
+        if self.palette.is_none() {
+            self.toggle_palette(window, cx);
+        }
+    }
+
+    /// Opens a new tab beside the one the request was made from, at
+    /// `[ui] new_tab_path` when it is a folder that exists, and at home
+    /// otherwise.
+    ///
+    /// The existence check is a filesystem call, and a configured path can be a
+    /// network share that is asleep: asking for it on the UI thread would freeze
+    /// the window for as long as the share takes to time out. So the check runs
+    /// on the background executor and the tab opens when the answer arrives. An
+    /// empty path skips the check and opens at home at once.
+    ///
+    /// The request is held by the id of the tab it was made beside, not by the
+    /// pane's index: a pane can be closed or the split flipped while the check
+    /// is in flight, and the new tab must not land in whatever pane took that
+    /// index. If that tab is gone, the request is dropped.
     pub(crate) fn new_tab_in_pane(&mut self, pane_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(anchor) = self
+            .group
+            .tab(pane_index, self.group.active_tab(pane_index))
+            .map(|tab| tab.entity_id())
+        else {
+            // A pane always holds a tab; be safe rather than silent if that
+            // invariant is ever broken.
+            self.add_tab_at(pane_index, home_dir(), window, cx);
+            return;
+        };
+        let configured = self.ui.new_tab_path.trim().to_string();
+        if configured.is_empty() {
+            self.add_tab_beside(anchor, home_dir(), window, cx);
+            return;
+        }
+        let check = cx
+            .background_spawn(async move { std::path::Path::new(&configured).is_dir().then_some(configured) });
+        cx.spawn_in(
+            window,
+            async move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncWindowContext| {
+                let found = check.await;
+                this.update_in(cx, |this, window, cx| {
+                    this.add_tab_beside(anchor, found.unwrap_or_else(home_dir), window, cx);
+                })
+                .ok();
+            },
+        )
+        .detach();
+    }
+
+    /// Adds a tab beside `anchor`, unless that tab (and with it the pane) is
+    /// gone by now.
+    fn add_tab_beside(&mut self, anchor: gpui::EntityId, start: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pane_index, _)) = self.group.locate_tab(anchor) else {
+            return;
+        };
+        self.add_tab_at(pane_index, start, window, cx);
+    }
+
+    /// Adds a tab in `pane_index` at `start`, then activates and focuses it.
+    fn add_tab_at(&mut self, pane_index: usize, start: String, window: &mut Window, cx: &mut Context<Self>) {
         // Inherit the sidebar visibility of the pane's currently active tab so the
         // new tab looks continuous with what the user was just seeing.
         let sidebar_visible = self
@@ -428,7 +511,7 @@ impl ExplorerPage {
             return;
         };
         self.subscribe_tab(&tab, cx);
-        self.configure_tab(&tab, Some(home_dir()), sidebar_visible, cx);
+        self.configure_tab(&tab, Some(start), sidebar_visible, cx);
         // Make the pane active and focus its new (now active) tab.
         self.group.set_active(pane_index, window, cx);
         self.group.focus_active(window, cx);
@@ -992,13 +1075,11 @@ impl ExplorerPage {
             on_close_pane: Rc::new(|this: &mut Self, pane, window, cx| {
                 this.close_pane(pane, window, cx)
             }),
-            // The "+" opens the search box, as Ctrl+T does; Enter with
-            // nothing typed there makes the plain new tab.
+            // The "+" opens what `[ui] new_tab_mode` says: a tab at once, or
+            // the box. Shift+click always asks.
             on_new_tab: Rc::new(|this: &mut Self, pane, window, cx| {
-                this.set_active(pane, window, cx);
-                if this.palette.is_none() {
-                    this.toggle_palette(window, cx);
-                }
+                let ask = window.modifiers().shift;
+                this.new_tab_request(pane, ask, window, cx);
             }),
             on_activate_tab: Rc::new(|this: &mut Self, pane, tab, window, cx| {
                 this.activate_tab(pane, tab, window, cx)
@@ -1592,9 +1673,17 @@ impl Render for ExplorerPage {
             .on_action(cx.listener(|this, _: &FocusPrevPane, window, cx| {
                 this.focus_prev(window, cx);
             }))
-            // Ctrl+T opens the search box; Enter with nothing typed opens the
-            // plain new tab Ctrl+T used to (the "+" still does at once).
+            // Ctrl+T follows `[ui] new_tab_mode` and nothing else: the live
+            // modifier is read for the "+" click, not here, so a Shift chord
+            // rebound to this command still honours the folder mode. GoTo, and
+            // Shift+click on the "+", are the ways to ask.
             .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                let pane = this.group.active();
+                this.new_tab_request(pane, false, window, cx);
+            }))
+            // Ctrl+Shift+T opens the box that searches the computer or takes
+            // a typed path.
+            .on_action(cx.listener(|this, _: &GoTo, window, cx| {
                 this.toggle_palette(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
@@ -1729,6 +1818,23 @@ impl ExplorerPage {
     }
 
     /// Test entry points for the tab actions exercised without keybindings.
+    /// Sets `[ui] new_tab_mode` for a test, as the config would.
+    pub(crate) fn test_set_new_tab_mode(&mut self, mode: NewTabMode) {
+        self.ui.new_tab_mode = mode;
+    }
+
+    /// Sets `[ui] new_tab_path` for a test, as the config would.
+    pub(crate) fn test_set_new_tab_path(&mut self, path: &str) {
+        self.ui.new_tab_path = path.to_string();
+    }
+
+    /// Presses the tab strip's `+` for a test, through the same callback the
+    /// button calls.
+    pub(crate) fn test_press_plus(&mut self, pane_index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let callbacks = Self::pane_callbacks();
+        (callbacks.on_new_tab)(self, pane_index, window, cx);
+    }
+
     pub(crate) fn test_new_tab(
         &mut self,
         pane_index: usize,
